@@ -1,0 +1,209 @@
+"""due date manager script takes courses that were copied over from previous semesters and adjust their dates to current semester.
+	It accounts for daylight savings and also the fact that assignments and wikipages have different methods for changing dates"""
+
+import requests
+import wget
+import time
+from datetime import datetime
+import pandas as pd
+import bluefieldconfig as cfg
+from multiprocessing import Pool
+import pytz
+
+INSTANCE=cfg.domain['PROD'] #CHANGE TO SPECIFY SITE 
+HEADER={'Authorization':'Bearer ' + '%s' % cfg.token}
+cfg.os.system('clear')
+account_id = 1
+
+#this list of exemptions are courses that have already been manually processed by client
+exemption = ['MAT_1233_30_2021','NUR_4204_30_2021','NUR_5143_30_2021','NUR_5414_30_2021','PHS_1033_30_2021','NUR_5153_30_2021','NUR_3002_30_2021','NUR_5404_30_2021','MUS_1413_30_2021','PSY_1013_30_2021','NUR_5111_30_2021','ENG_1013_30_2021','NUR_5061_30_2021','NUR_5112_30_2021','NUR_3003_30_2021','NUR_3303_30_2021','CST_3213_30_2021','PHS_1031_30_2021','NUR_5144_30_2021','NUR_4303_30_2021','NUR_3403_30_2021','ESS_1581_30_2021','MGT_3173_30_2021']
+
+
+def delete_csv(file, name):
+	"""deletes file"""
+	remove(file)
+	print('\n', name, 'has been deleted')
+
+
+def get_file(url, name):
+	"""downloads file"""
+
+	DESKTOP = cfg.desktop + name
+
+	print(url, '\n\n')
+	wget.download(url,DESKTOP)
+	return DESKTOP
+
+
+def report_progress(report_id, csv_url):
+	"""prints the progress of the provisioning report and
+		returns file url and name when complete"""
+	progress = 0
+
+	URL = csv_url + '/' + str(report_id)
+
+	while progress != 100:
+		request = requests.get(URL, headers=HEADER)
+		response=request.json()
+		progress = response['progress']
+
+		print('	provisioning report progress is at:', progress)
+
+		if progress != 100:
+			time.sleep(10)
+		elif progress == 100:
+			file_name = response['attachment']['display_name']
+			file_url = response['attachment']['url']
+			break
+
+	return file_url, file_name
+
+
+def provisioning_csv(account_id):
+	"""generates a provisioning report, the library to 
+		download report is broken so script is paused to I can manually download"""
+
+	URL = INSTANCE['ACCOUNT'] + str(account_id) + '/reports/provisioning_csv'
+	payload = {'parameters[courses]': True}
+	request = requests.post(URL, params=payload, headers=HEADER)
+	response = request.json()
+
+	print(f"\nREPORT ID: {response['id']}. STATUS: {response['status']}. CREATED AT: {response['created_at']}")
+
+	report_id =response['id']
+
+	file_url, file_name = report_progress(report_id, URL)
+
+	get_file(file_url, file_name)
+	x = input('pauseeee to move file')
+
+
+def get_wikipages(course_id):
+	"""returns all pages in a course"""
+	URL = INSTANCE['COURSE'] + str(course_id) + '/pages?per_page=100'
+	request = requests.get(URL , headers=HEADER)
+	response = request.json()
+	return response
+
+def set_wikipages(var):
+	"""modifies the due dates on pages"""
+	course_id, wiki,todo_date  = var 
+
+	payload = {'wiki_page[student_todo_at]':todo_date}
+	URL = INSTANCE['COURSE'] + str(course_id) + '/pages/' + str(wiki)
+
+	request = requests.put(URL ,params=payload, headers=HEADER)
+	response = request.json()
+
+def get_assignments(course_id):
+	"""returns all assignments in a course"""
+	URL = INSTANCE['COURSE'] + str(course_id) + '/assignments?per_page=100'
+	request = requests.get(URL , headers=HEADER)
+	response = request.json()
+	return response
+
+def set_bulk_assignments(course_id, VAR):
+	"""bulk updates assignments based on passed array"""
+	URL = INSTANCE['COURSE'] + str(course_id) + '/assignments/bulk_update'
+	request = requests.put(URL,json=VAR, headers=HEADER)
+	response = request.json()
+	print(request.status_code)
+	pages = get_wikipages(course_id)
+
+def get_master_start(course_id):
+	"""returns start date of master course"""
+	URL = INSTANCE['COURSE'] + str(course_id)
+	request = requests.get(URL , headers=HEADER)
+	response = request.json()
+	return response['start_at']
+
+def bulk_dict(course_id,live_sis, move, master_start_at):
+	"""gets dates, convert it from utc to etc timezone to account for daylight savings before applying date adjustment
+		converts back to utc before pushing change"""
+
+	est = pytz.timezone('US/Eastern')
+	utc = pytz.utc
+	fmt = '%Y-%m-%d %H:%M:%S %Z%z'
+
+	print(live_sis, master_start_at, '\n')
+	assignments = get_assignments(course_id)
+
+	for i in assignments:
+		if i['due_at'] != None:
+
+			p_date = pd.to_datetime(i['due_at'])
+
+			est_date =  (p_date.astimezone(est) + pd.DateOffset(days=+move)).astimezone(utc)
+
+			print(i['name'], ' FROM ', p_date.astimezone(est), ' TO ', est_date.astimezone(est))
+
+			bulk.append({"id":i['id'], "all_dates":[{"base":True, "due_at": est_date.isoformat() }] })
+
+			set_bulk_assignments(course_id, bulk)
+
+	print('\n\n')
+
+
+	wikis = [[i['title'],i['url'], i['todo_date']] for i in pages if i['todo_date']]
+	if wikis and live_sis not in exemption:
+		print(live_sis, master_start_at)
+
+		for i in wikis:
+			p_date = pd.to_datetime(i[2])
+			est_date =  (p_date.astimezone(est) + pd.DateOffset(days=+move)).astimezone(utc)
+			print(i[0], ' FROM ', p_date.astimezone(est), ' TO ', est_date.astimezone(est))
+			var = [course_id, i[1], est_date.isoformat()]
+
+			set_wikipages(var)
+
+		print('\n\n')
+
+	
+def sub_main(var):
+	"""this function gets course and master details, calls get_assignments() to receive list of get_assignments
+		which is parsed to generate parameter for bulk update"""
+	
+	if var: #list contained a bunch of NONE values
+		live_id, live_sis, master = var
+		if master:
+			master_start_at = get_master_start(master[0][0])
+			if master_start_at:
+				if '2021-08-18' in master_start_at:
+					move = 147
+					bulk_dict(live_id, live_sis, move, master_start_at)
+				elif '2021-10-13' in master_start_at:
+					move = 91
+					bulk_dict(live_id, live_sis, move, master_start_at)
+
+def main():
+	"""main function calls all other functions"""
+
+	print(f"\nBLUEFIELD COURSE COPY: {INSTANCE['ACCOUNT']} \n")
+	val = input("'a' to download provisioning report \n'b' to run the manage due dates\nPlease select one of the above: ")
+
+	if val == 'a':
+		provisioning_csv(account_id)
+	elif val == 'b':
+		df = pd.read_csv(cfg.desktop +'/bluefield_beta_report.csv')
+
+		masters = df[df['long_name'].str.contains(' MASTER', na=False)]	
+		masterdict = dict(zip(masters.long_name, masters.canvas_course_id))
+
+		live = df[df['course_id'].str.contains('_30_2021', na=False)]
+		livelist = list(zip(live.canvas_course_id, live.course_id))
+
+		#for every live course pull subject code and number, replace _ with ' ' and find any master that contains the same subj and number
+		#return [live_id, live_name, [[master_id, master_name]]]
+		poolvars = [[i[0], i[1], [[value,key] for key, value in masterdict.items() if i[1][:8].replace('_', ' ') in key]] for i in livelist]
+
+		#removes and print any live courses without masters
+		#poolvars = [copy if copy[2] else print(f'{copy[1]} does not have a MASTER.') for copy in poolvars]	
+
+		for i in poolvars:
+			sub_main(i)
+
+	else:
+		print('**ERROR: Invalid Entry. Terminating....')
+
+if __name__ == "__main__":
+	main() 
